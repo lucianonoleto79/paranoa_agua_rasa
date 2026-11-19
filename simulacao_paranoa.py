@@ -1,0 +1,487 @@
+"""
+Simulação 2D da dispersão de um poluente no Lago Paranoá (Brasília-DF)
+usando as Equações de Água Rasa (Shallow Water Equations) integradas na
+vertical, com PROFUNDIDADE CONSTANTE, acopladas a uma equação de
+advecção-difusão-decaimento para o poluente.
+
+Geometria: contorno REAL do lago obtido do OpenStreetMap (relação OSM
+2758139, "Lago Paranoá", via API Nominatim), incluindo as ilhas.
+Dados © OpenStreetMap contributors, licença ODbL.
+O contorno é baixado na 1ª execução e guardado em 'paranoa_osm.geojson'.
+
+ATENÇÃO — modelo DIDÁTICO:
+  * Profundidade constante (parâmetro 'prof'); o lago real tem batimetria
+    variável.
+  * Posições de afluentes, barragem, lançamento e pontos de monitoramento são
+    APROXIMADAS (colocadas nas pontas dos braços / pontos plausíveis).
+    Confira no mapa 01_mapa.png e corrija as coordenadas se necessário.
+  * Vazões, vento e cargas são valores ILUSTRATIVOS de ordem de grandeza.
+
+Física:
+  ∂η/∂t + ∂(Hu)/∂x + ∂(Hv)/∂y = S_vol                       (continuidade)
+  ∂u/∂t = -g ∂η/∂x + f v - Cd|U|u/H + τx/(ρH) + ν∇²u         (momento x)
+  ∂v/∂t = -g ∂η/∂y - f u - Cd|U|v/H + τy/(ρH) + ν∇²v         (momento y)
+  ∂(HC)/∂t + ∇·(HUC) = ∇·(H Kh ∇C) - k H C + fontes           (poluente)
+
+  η = elevação da superfície, h = profundidade em repouso (constante),
+  H = h + η. Advecção não-linear do momento omitida (correntes muito fracas).
+  Com profundidade constante, a corrente média gerada pelo vento é pequena
+  (o vento principalmente inclina a superfície); o transporte do poluente é
+  dominado pelo fluxo afluentes → barragem e pela difusão turbulenta.
+
+Numérica: grade C de Arakawa, esquema explícito "forward-backward",
+atrito de fundo semi-implícito, transporte do poluente upwind conservativo
+(volumes finitos: conserva massa e não gera concentrações negativas).
+
+Dependências: numpy, matplotlib (pillow opcional, para o GIF).
+    pip install numpy matplotlib pillow
+"""
+
+import os
+import json
+import time
+import urllib.request
+from collections import deque
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import animation
+from matplotlib.colors import LogNorm
+from matplotlib.path import Path
+
+# =============================================================================
+# 1. PARÂMETROS (edite aqui)
+# =============================================================================
+CFG = dict(
+    # --- grade e tempo ---
+    dx=100.0,                 # resolução (m)
+    t_final=6 * 86400.0,      # duração (s)
+    cfl=0.5,                  # fator de segurança do passo de tempo
+    saida_cada=6 * 3600.0,    # intervalo entre quadros salvos (s)
+
+    # --- física ---
+    g=9.81,
+    latitude=-15.8,           # Brasília (graus)
+    prof=12.0,                # profundidade constante (m) [aprox.]
+    cd_fundo=2.5e-3,          # coef. de atrito de fundo (quadrático)
+    nu=5.0,                   # viscosidade turbulenta horizontal (m²/s)
+    Kh=5.0,                   # difusividade turbulenta horizontal (m²/s)
+    decaimento=0.2,           # decaimento de 1ª ordem (1/dia); 0 = conservativo
+
+    # --- vento (convenção meteorológica: direção DE ONDE sopra) ---
+    vento_vel=5.0,            # m/s a 10 m
+    vento_dir=90.0,           # graus (90 = vento de leste) [ilustrativo]
+    rho_ar=1.2, rho_agua=1000.0, cd_vento=1.3e-3,
+    rampa_vento=6 * 3600.0,   # liga o vento gradualmente (evita choque/seiche)
+
+    # --- poluente ---
+    # 'continuo': lançamento contínuo (ex.: efluente de ETE)
+    # 'derrame' : massa instantânea no instante t=0 (ex.: acidente)
+    modo='continuo',
+    fonte_lonlat=(-47.884, -15.833),  # braço do Riacho Fundo [aprox.]
+    Q_fonte=1.5,              # vazão do efluente (m³/s) [ilustrativo]
+    C_fonte=100.0,            # concentração no efluente (mg/L = g/m³)
+    massa_derrame=5e6,        # massa no modo 'derrame' (g)
+    duracao_fonte=None,       # s; None = lança durante toda a simulação
+
+    # --- geometria ---
+    osm_id='R2758139',        # relação OSM do Lago Paranoá
+    arquivo_contorno='paranoa_osm.geojson',
+
+    # --- saída ---
+    pasta_saida='saida_paranoa',
+    escala_log=True,          # mapas de concentração em escala logarítmica
+    gerar_gif=True,
+)
+
+# Afluentes: (lon, lat) aproximados nas pontas dos braços, vazão (m³/s) ilustrativa.
+AFLUENTES = {
+    'Riacho Fundo':      ((-47.905, -15.842), 2.0),
+    'Ribeirão do Gama':  ((-47.872, -15.857), 1.5),
+    'Ribeirão Bananal':  ((-47.896, -15.729), 1.0),
+    'Ribeirão do Torto': ((-47.855, -15.726), 2.5),
+}
+BARRAGEM_LONLAT = (-47.786, -15.798)   # extremo leste [aprox.]
+
+# Pontos de monitoramento (lon, lat)
+PONTOS = {
+    'P1 braço R. Fundo': (-47.866, -15.825),
+    'P2 corpo central':  (-47.821, -15.807),
+    'P3 braço norte':    (-47.852, -15.762),
+    'P4 barragem':       (-47.800, -15.796),
+}
+
+R_TERRA = 6_371_000.0
+
+
+# =============================================================================
+# 2. GEOMETRIA REAL (OpenStreetMap)
+# =============================================================================
+def obter_contorno_osm(cfg):
+    """Retorna a geometria GeoJSON (Polygon/MultiPolygon) do lago.
+    Usa o arquivo em cache se existir; senão baixa do Nominatim (OSM)."""
+    arq = cfg['arquivo_contorno']
+    if os.path.exists(arq):
+        with open(arq) as fh:
+            return json.load(fh)
+    url = ('https://nominatim.openstreetmap.org/lookup?osm_ids='
+           f"{cfg['osm_id']}&format=json&polygon_geojson=1")
+    print('Baixando contorno do lago do OpenStreetMap (Nominatim)...')
+    req = urllib.request.Request(url, headers={'User-Agent': 'lake-dispersion-sim/1.0'})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            dados = json.load(r)
+    except Exception as e:
+        raise SystemExit(f'Não foi possível baixar o contorno ({e}). Verifique a '
+                         f'conexão ou coloque um GeoJSON em {arq}.')
+    if not dados:
+        raise SystemExit('Nominatim não retornou geometria para ' + cfg['osm_id'])
+    geo = dados[0]['geojson']
+    with open(arq, 'w') as fh:
+        json.dump(geo, fh)
+    return geo
+
+
+class Projecao:
+    """lon/lat -> metros locais (equiretangular; erro desprezível em ~15 km)."""
+    def __init__(self, lon0, lat0):
+        self.lon0, self.lat0 = lon0, lat0
+        self.kx = R_TERRA * np.cos(np.deg2rad(lat0)) * np.pi / 180
+        self.ky = R_TERRA * np.pi / 180
+
+    def __call__(self, lon, lat):
+        return (np.asarray(lon) - self.lon0) * self.kx, (np.asarray(lat) - self.lat0) * self.ky
+
+
+def _maior_componente(m):
+    """Mantém apenas o maior conjunto conexo (vizinhança 4) de células True."""
+    rot = -np.ones(m.shape, int)
+    tamanhos = []
+    ny, nx = m.shape
+    for j0, i0 in zip(*np.nonzero(m)):
+        if rot[j0, i0] >= 0:
+            continue
+        k = len(tamanhos); rot[j0, i0] = k; fila = deque([(j0, i0)]); n = 0
+        while fila:
+            j, i = fila.popleft(); n += 1
+            for jj, ii in ((j+1, i), (j-1, i), (j, i+1), (j, i-1)):
+                if 0 <= jj < ny and 0 <= ii < nx and m[jj, ii] and rot[jj, ii] < 0:
+                    rot[jj, ii] = k; fila.append((jj, ii))
+        tamanhos.append(n)
+    return rot == int(np.argmax(tamanhos))
+
+
+def construir_lago(cfg):
+    """Retorna X, Y (centros de célula, m), máscara molhada, h (m), projeção e
+    anéis do contorno em metros (para desenhar)."""
+    geo = obter_contorno_osm(cfg)
+    poligonos = [geo['coordinates']] if geo['type'] == 'Polygon' else geo['coordinates']
+    todos = np.vstack([np.array(p[0]) for p in poligonos])
+    proj = Projecao(todos[:, 0].min(), todos[:, 1].min())
+
+    dx = cfg['dx']; borda = 2 * dx
+    aneis = [[np.column_stack(proj(np.array(r)[:, 0], np.array(r)[:, 1])) for r in p]
+             for p in poligonos]
+    xmax = max(a[0][:, 0].max() for a in aneis); ymax = max(a[0][:, 1].max() for a in aneis)
+    for p in aneis:                      # desloca para deixar margem seca
+        for a in p:
+            a += borda
+    nx, ny = int(np.ceil((xmax + 2 * borda) / dx)), int(np.ceil((ymax + 2 * borda) / dx))
+    x = (np.arange(nx) + 0.5) * dx; y = (np.arange(ny) + 0.5) * dx
+    X, Y = np.meshgrid(x, y)
+    pts = np.column_stack([X.ravel(), Y.ravel()])
+
+    molhado = np.zeros(X.size, bool)
+    for p in aneis:
+        dentro = Path(p[0]).contains_points(pts)
+        for ilha in p[1:]:
+            dentro &= ~Path(ilha).contains_points(pts)
+        molhado |= dentro
+    molhado = molhado.reshape(X.shape)
+    molhado[0, :] = molhado[-1, :] = molhado[:, 0] = molhado[:, -1] = False
+    molhado = _maior_componente(molhado)
+
+    h = np.where(molhado, cfg['prof'], 0.0)
+    # projeção com o deslocamento da margem embutido
+    proj_final = lambda lon, lat: tuple(c + borda for c in proj(lon, lat))
+    return X, Y, molhado, h, proj_final, aneis
+
+
+def indice_celula(xy, X, Y, molhado):
+    """Célula molhada mais próxima de um ponto (x, y) em metros."""
+    d = np.hypot(X - xy[0], Y - xy[1])
+    d[~molhado] = np.inf
+    return np.unravel_index(np.argmin(d), d.shape)
+
+
+# =============================================================================
+# 3. MODELO
+# =============================================================================
+def laplaciano(a, dx):
+    return (np.roll(a, 1, 0) + np.roll(a, -1, 0) +
+            np.roll(a, 1, 1) + np.roll(a, -1, 1) - 4.0 * a) / dx**2
+
+
+def simular(cfg=CFG):
+    os.makedirs(cfg['pasta_saida'], exist_ok=True)
+    X, Y, wet, h, proj, aneis = construir_lago(cfg)
+    ny, nx = h.shape
+    dx, g = cfg['dx'], cfg['g']
+    area = dx * dx
+
+    print(f"Grade: {nx} x {ny} células, {wet.sum()} molhadas")
+    print(f"Área do lago (raster): {wet.sum() * area / 1e6:.1f} km² | "
+          f"profundidade constante: {cfg['prof']:.1f} m | "
+          f"volume: {(h[wet].sum() * area) / 1e6:.0f} hm³")
+
+    # converte posições lon/lat -> metros
+    afl_xy = {n: (proj(*ll), Q) for n, (ll, Q) in AFLUENTES.items()}
+    barr_xy = proj(*BARRAGEM_LONLAT)
+    fonte_xy = proj(*cfg['fonte_lonlat'])
+    pontos_xy = {n: proj(*ll) for n, ll in PONTOS.items()}
+
+    # máscaras das faces (grade C): face aberta só se as 2 células são água
+    mu = np.zeros((ny, nx + 1), bool); mu[:, 1:-1] = wet[:, :-1] & wet[:, 1:]
+    mv = np.zeros((ny + 1, nx), bool); mv[1:-1, :] = wet[:-1, :] & wet[1:, :]
+
+    # estado
+    eta = np.zeros((ny, nx))
+    u = np.zeros((ny, nx + 1))
+    v = np.zeros((ny + 1, nx))
+    C = np.zeros((ny, nx))                    # g/m³ (= mg/L)
+
+    f = 2 * 7.2921e-5 * np.sin(np.deg2rad(cfg['latitude']))
+
+    # tensão do vento (N/m²); direção meteorológica -> vetor "para onde vai"
+    ang = np.deg2rad(cfg['vento_dir'])
+    Wx, Wy = -cfg['vento_vel'] * np.sin(ang), -cfg['vento_vel'] * np.cos(ang)
+    W = np.hypot(Wx, Wy)
+    taux = cfg['rho_ar'] * cfg['cd_vento'] * W * Wx
+    tauy = cfg['rho_ar'] * cfg['cd_vento'] * W * Wy
+
+    # fontes/sumidouros de volume (m³/s por célula)
+    Qsrc = np.zeros((ny, nx))
+    for nome, (xy, Q) in afl_xy.items():
+        Qsrc[indice_celula(xy, X, Y, wet)] += Q
+    jf, if_ = indice_celula(fonte_xy, X, Y, wet)
+    jb, ib = indice_celula(barr_xy, X, Y, wet)
+    Q_ete = cfg['Q_fonte'] if cfg['modo'] == 'continuo' else 0.0
+
+    if cfg['modo'] == 'derrame':
+        C[jf, if_] = cfg['massa_derrame'] / (h[jf, if_] * area)
+
+    k_dec = cfg['decaimento'] / 86400.0
+
+    dt = cfg['cfl'] * dx / np.sqrt(2 * g * h.max())
+    nsteps = int(np.ceil(cfg['t_final'] / dt))
+    print(f"dt = {dt:.2f} s, {nsteps} passos")
+
+    pontos_idx = {n: indice_celula(xy, X, Y, wet) for n, xy in pontos_xy.items()}
+    serie_t, serie_C = [], {n: [] for n in PONTOS}
+    quadros = []            # (t, C, u_c, v_c)
+    massa_lancada = cfg['massa_derrame'] if cfg['modo'] == 'derrame' else 0.0
+    massa_saiu = 0.0
+    massa_decaiu = 0.0
+    prox_saida = 0.0
+    t = 0.0
+    t0 = time.time()
+
+    for n in range(nsteps + 1):
+        # ---------------- saídas ----------------
+        if t >= prox_saida - 1e-9:
+            uc = 0.5 * (u[:, 1:] + u[:, :-1]); vc = 0.5 * (v[1:, :] + v[:-1, :])
+            quadros.append((t, C.copy(), uc, vc))
+            prox_saida += cfg['saida_cada']
+        if n % 20 == 0:
+            serie_t.append(t)
+            for nome, (j, i) in pontos_idx.items():
+                serie_C[nome].append(C[j, i])
+        if n == nsteps:
+            break
+
+        H = np.where(wet, h + eta, 0.0)
+        Hu = np.zeros_like(u); Hu[:, 1:-1] = 0.5 * (H[:, :-1] + H[:, 1:])
+        Hv = np.zeros_like(v); Hv[1:-1, :] = 0.5 * (H[:-1, :] + H[1:, :])
+
+        # ---------------- continuidade ----------------
+        Fx = Hu * u * mu        # transporte (m²/s) nas faces x
+        Fy = Hv * v * mv
+        fonte_ativa = (cfg['modo'] == 'continuo' and
+                       (cfg['duracao_fonte'] is None or t < cfg['duracao_fonte']))
+        S = Qsrc.copy()
+        if fonte_ativa:
+            S[jf, if_] += Q_ete
+        Q_saida = Qsrc.sum() + (Q_ete if fonte_ativa else 0.0)   # nível médio constante
+        S[jb, ib] -= Q_saida
+        V_old = H * area
+        eta = eta - dt * ((Fx[:, 1:] - Fx[:, :-1]) / dx + (Fy[1:, :] - Fy[:-1, :]) / dx) \
+                  + dt * S / area
+        eta[~wet] = 0.0
+
+        # ---------------- poluente (volumes finitos, upwind) ----------------
+        M = C * V_old                                   # massa (g)
+        Cl, Cr = np.zeros_like(u), np.zeros_like(u)
+        Cl[:, 1:-1], Cr[:, 1:-1] = C[:, :-1], C[:, 1:]
+        Cb, Ct = np.zeros_like(v), np.zeros_like(v)
+        Cb[1:-1, :], Ct[1:-1, :] = C[:-1, :], C[1:, :]
+        Gx = (Fx * np.where(Fx > 0, Cl, Cr) - cfg['Kh'] * Hu * (Cr - Cl) / dx * mu) * dx
+        Gy = (Fy * np.where(Fy > 0, Cb, Ct) - cfg['Kh'] * Hv * (Ct - Cb) / dx * mv) * dx
+        M = M - dt * ((Gx[:, 1:] - Gx[:, :-1]) + (Gy[1:, :] - Gy[:-1, :]))
+        if fonte_ativa:
+            dm = cfg['C_fonte'] * Q_ete * dt
+            M[jf, if_] += dm; massa_lancada += dm
+        saida = min(Q_saida * C[jb, ib] * dt, M[jb, ib])
+        M[jb, ib] -= saida; massa_saiu += saida
+        perda = M * (1 - np.exp(-k_dec * dt)); M -= perda; massa_decaiu += perda.sum()
+
+        Hn = np.where(wet, h + eta, 0.0)
+        C = np.where(wet, M / np.maximum(Hn * area, 1e-9), 0.0)
+        C = np.maximum(C, 0.0)
+
+        # ---------------- momento (com eta novo: forward-backward) ----------------
+        rampa = min(1.0, t / cfg['rampa_vento']) if cfg['rampa_vento'] > 0 else 1.0
+        Hu = np.zeros_like(u); Hu[:, 1:-1] = 0.5 * (Hn[:, :-1] + Hn[:, 1:])
+        Hv = np.zeros_like(v); Hv[1:-1, :] = 0.5 * (Hn[:-1, :] + Hn[1:, :])
+
+        # u
+        v_u = np.zeros_like(u)
+        v_u[:, 1:-1] = 0.25 * (v[:-1, :-1] + v[1:, :-1] + v[:-1, 1:] + v[1:, 1:])
+        dedx = np.zeros_like(u); dedx[:, 1:-1] = (eta[:, 1:] - eta[:, :-1]) / dx
+        Hu_s = np.maximum(Hu, 0.1)
+        rhs = (-g * dedx + f * v_u + rampa * taux / (cfg['rho_agua'] * Hu_s)
+               + cfg['nu'] * laplaciano(u * mu, dx))
+        atr = cfg['cd_fundo'] * np.hypot(u, v_u) / Hu_s
+        u = np.where(mu, (u + dt * rhs) / (1 + dt * atr), 0.0)
+
+        # v (usa u já atualizado -> Coriolis mais estável)
+        u_v = np.zeros_like(v)
+        u_v[1:-1, :] = 0.25 * (u[:-1, :-1] + u[:-1, 1:] + u[1:, :-1] + u[1:, 1:])
+        dedy = np.zeros_like(v); dedy[1:-1, :] = (eta[1:, :] - eta[:-1, :]) / dx
+        Hv_s = np.maximum(Hv, 0.1)
+        rhs = (-g * dedy - f * u_v + rampa * tauy / (cfg['rho_agua'] * Hv_s)
+               + cfg['nu'] * laplaciano(v * mv, dx))
+        atr = cfg['cd_fundo'] * np.hypot(v, u_v) / Hv_s
+        v = np.where(mv, (v + dt * rhs) / (1 + dt * atr), 0.0)
+
+        t += dt
+        if n % 10000 == 0 and n > 0:
+            vel = np.hypot(0.5 * (u[:, 1:] + u[:, :-1]), 0.5 * (v[1:, :] + v[:-1, :]))
+            print(f"  t = {t/3600:6.1f} h | |U|max = {vel.max():.4f} m/s | "
+                  f"η = [{eta[wet].min()*100:.2f}, {eta[wet].max()*100:.2f}] cm | "
+                  f"Cmax = {C.max():.2f} mg/L | {time.time()-t0:.0f} s")
+
+    massa_lago = (C * np.where(wet, h + eta, 0) * area).sum()
+    erro = massa_lancada - massa_lago - massa_saiu - massa_decaiu
+    print(f"\nMassa lançada: {massa_lancada/1e6:.3f} t | no lago: {massa_lago/1e6:.3f} t | "
+          f"saiu pela barragem: {massa_saiu/1e6:.3f} t | decaiu: {massa_decaiu/1e6:.3f} t")
+    print(f"Erro de conservação: {erro/max(massa_lancada,1e-12)*100:.2e} %")
+
+    return dict(X=X, Y=Y, wet=wet, h=h, aneis=aneis, quadros=quadros,
+                serie_t=np.array(serie_t),
+                serie_C={k: np.array(v) for k, v in serie_C.items()},
+                afl_xy=afl_xy, barr_xy=barr_xy, fonte_xy=fonte_xy,
+                pontos_xy=pontos_xy, cfg=cfg)
+
+
+# =============================================================================
+# 4. VISUALIZAÇÃO
+# =============================================================================
+ATRIB = '© OpenStreetMap contributors (ODbL)'
+
+
+def _contorno(ax, aneis):
+    for p in aneis:
+        for a in p:
+            ax.plot(a[:, 0] / 1e3, a[:, 1] / 1e3, 'k-', lw=0.6)
+
+
+def _rodape(ax):
+    ax.text(0.99, 0.01, ATRIB, transform=ax.transAxes, ha='right', va='bottom',
+            fontsize=6, color='0.3')
+
+
+def plotar(res):
+    X, Y, wet = res['X'] / 1e3, res['Y'] / 1e3, res['wet']
+    cfg = res['cfg']; out = cfg['pasta_saida']
+    ny, nx = wet.shape
+    ext = [0, nx * cfg['dx'] / 1e3, 0, ny * cfg['dx'] / 1e3]
+    km = lambda xy: (xy[0] / 1e3, xy[1] / 1e3)
+
+    # --- mapa: contorno real, afluentes, barragem, fonte, pontos ---
+    fig, ax = plt.subplots(figsize=(7.5, 8))
+    ax.imshow(np.where(wet, 1.0, np.nan), origin='lower', extent=ext, cmap='Blues',
+              vmin=0, vmax=2)
+    _contorno(ax, res['aneis'])
+    for nome, (xy, Q) in res['afl_xy'].items():
+        ax.plot(*km(xy), 'g^', ms=8)
+        ax.annotate(f'{nome}\n({Q} m³/s)', km(xy), fontsize=7, xytext=(5, 3), textcoords='offset points')
+    ax.plot(*km(res['barr_xy']), 'ks', ms=9)
+    ax.annotate('Barragem', km(res['barr_xy']), fontsize=8, xytext=(-20, 10), textcoords='offset points')
+    ax.plot(*km(res['fonte_xy']), 'r*', ms=15, label='Lançamento')
+    for nome, xy in res['pontos_xy'].items():
+        ax.plot(*km(xy), 'o', mfc='none', mec='k')
+        ax.annotate(nome.split()[0], km(xy), fontsize=8, xytext=(4, -10), textcoords='offset points')
+    ax.set(title=f"Lago Paranoá — contorno OSM, profundidade constante {cfg['prof']:.0f} m",
+           xlabel='x (km)', ylabel='y (km)', aspect='equal')
+    ax.legend(loc='upper right'); _rodape(ax); fig.tight_layout()
+    fig.savefig(f'{out}/01_mapa.png', dpi=150); plt.close(fig)
+
+    # --- mapas de concentração ---
+    quadros = res['quadros']
+    idx = np.linspace(1, len(quadros) - 1, 4).astype(int)
+    vmax = max(np.percentile(quadros[-1][1][wet], 99.9), 1e-2)
+    norm = LogNorm(vmin=1e-3, vmax=vmax) if cfg['escala_log'] else plt.Normalize(0, vmax)
+    mascara = lambda C: np.ma.masked_where(~wet | (cfg['escala_log'] & (C < 1e-3)), C)
+    fig, axs = plt.subplots(2, 2, figsize=(12, 12.5))
+    s = max(1, int(700 / cfg['dx']))
+    for ax, k in zip(axs.flat, idx):
+        t, C, uc, vc = quadros[k]
+        ax.imshow(np.where(wet, 1.0, np.nan), origin='lower', extent=ext, cmap='Blues', vmin=0, vmax=6)
+        im = ax.imshow(mascara(C), origin='lower', extent=ext, cmap='turbo', norm=norm)
+        _contorno(ax, res['aneis'])
+        m = wet[::s, ::s]
+        # setas com escala fixa (2 mm/s = 1 km); limitadas a 3 mm/s para que o
+        # escoamento local forte junto à barragem não esconda o resto
+        us, vs = uc[::s, ::s][m], vc[::s, ::s][m]
+        fat = np.minimum(1.0, 0.003 / np.maximum(np.hypot(us, vs), 1e-12))
+        q = ax.quiver(X[::s, ::s][m], Y[::s, ::s][m], us * fat, vs * fat, color='0.25',
+                      angles='xy', scale_units='xy', scale=0.002, width=0.0025)
+        ax.quiverkey(q, 0.78, 0.95, 0.002, '2 mm/s', coordinates='axes')
+        ax.set(title=f't = {t/3600:.0f} h', xlabel='x (km)', ylabel='y (km)', aspect='equal')
+        plt.colorbar(im, ax=ax, label='C (mg/L)', shrink=0.75)
+        _rodape(ax)
+    fig.suptitle(f"Dispersão do poluente — vento {cfg['vento_vel']} m/s de {cfg['vento_dir']:.0f}°, "
+                 f"Kh = {cfg['Kh']} m²/s", fontsize=14)
+    fig.tight_layout(); fig.savefig(f'{out}/02_concentracao.png', dpi=150); plt.close(fig)
+
+    # --- séries temporais ---
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    for nome, c in res['serie_C'].items():
+        ax.plot(res['serie_t'] / 3600, c, label=nome)
+    ax.set(xlabel='Tempo (h)', ylabel='C (mg/L)', title='Concentração nos pontos de monitoramento')
+    ax.grid(alpha=0.3); ax.legend(); fig.tight_layout()
+    fig.savefig(f'{out}/03_series.png', dpi=150); plt.close(fig)
+
+    # --- animação ---
+    if cfg['gerar_gif']:
+        fig, ax = plt.subplots(figsize=(7, 7.5))
+        ax.imshow(np.where(wet, 1.0, np.nan), origin='lower', extent=ext, cmap='Blues', vmin=0, vmax=6)
+        im = ax.imshow(mascara(quadros[0][1]), origin='lower', extent=ext, cmap='turbo', norm=norm)
+        _contorno(ax, res['aneis']); _rodape(ax); ax.set_aspect('equal')
+        plt.colorbar(im, ax=ax, label='C (mg/L)', shrink=0.75)
+        tit = ax.set_title('')
+        def upd(k):
+            im.set_data(mascara(quadros[k][1])); tit.set_text(f't = {quadros[k][0]/3600:.0f} h')
+            return im, tit
+        try:
+            anim = animation.FuncAnimation(fig, upd, frames=len(quadros), interval=300)
+            anim.save(f'{out}/04_animacao.gif', writer=animation.PillowWriter(fps=4))
+        except Exception as e:
+            print('GIF não gerado:', e)
+        plt.close(fig)
+    print(f"Figuras salvas em ./{out}/")
+
+
+if __name__ == '__main__':
+    resultado = simular(CFG)
+    plotar(resultado)
