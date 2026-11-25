@@ -55,8 +55,10 @@ braço; massa do poluente conservada a 4×10⁻¹² (relativo). A superfície qu
 (|η| < 0,005 cm).
 
 Saída em [`resultados/caso_cordel_7d/`](resultados/caso_cordel_7d/) (figuras, `simulacao.log`;
-o `resultados.npz` não é versionado). A comparação com o Cordel e o fvm-cfd está no Cordel, em
-`resultados/comparacao_paranoa/`. **Ilustrativo, não calibrado.**
+o `resultados.npz` não é versionado). A comparação com o Cordel e o fvm-cfd, com sugestões de
+tópicos para um trabalho de disciplina, está em
+[`resultados/comparacao_codigos/`](resultados/comparacao_codigos/) (cópia do relatório do Cordel,
+`resultados/comparacao_paranoa/`). **Ilustrativo, não calibrado.**
 
 ![Caso do Cordel, 7 dias](resultados/caso_cordel_7d/02_concentracao.png)
 
