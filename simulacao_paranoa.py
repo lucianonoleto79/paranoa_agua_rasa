@@ -174,10 +174,18 @@ def _maior_componente(m):
 def construir_lago(cfg):
     """Retorna X, Y (centros de célula, m), máscara molhada, h (m), projeção e
     anéis do contorno em metros (para desenhar)."""
-    geo = obter_contorno_osm(cfg)
-    poligonos = [geo['coordinates']] if geo['type'] == 'Polygon' else geo['coordinates']
-    todos = np.vstack([np.array(p[0]) for p in poligonos])
-    proj = Projecao(todos[:, 0].min(), todos[:, 1].min())
+    if cfg.get('contorno_utm'):
+        # contorno já em metros (UTM), como o do Cordel: um anel sem ilhas
+        with open(cfg['contorno_utm']) as fh:
+            anel = np.array(json.load(fh)['contorno'], float)
+        poligonos = [[anel.tolist()]]
+        x0, y0 = anel.min(0)
+        proj = lambda x, y: (np.asarray(x) - x0, np.asarray(y) - y0)
+    else:
+        geo = obter_contorno_osm(cfg)
+        poligonos = [geo['coordinates']] if geo['type'] == 'Polygon' else geo['coordinates']
+        todos = np.vstack([np.array(p[0]) for p in poligonos])
+        proj = Projecao(todos[:, 0].min(), todos[:, 1].min())
 
     dx = cfg['dx']; borda = 2 * dx
     aneis = [[np.column_stack(proj(np.array(r)[:, 0], np.array(r)[:, 1])) for r in p]
@@ -235,10 +243,14 @@ def simular(cfg=CFG):
           f"volume: {(h[wet].sum() * area) / 1e6:.0f} hm³")
 
     # converte posições lon/lat -> metros
-    afl_xy = {n: (proj(*ll), Q) for n, (ll, Q) in AFLUENTES.items()}
-    barr_xy = proj(*BARRAGEM_LONLAT)
+    # afluentes: (posição, Q) ou (posição, Q, C da água que entra)
+    afluentes = cfg.get('afluentes') or AFLUENTES
+    afl_xy = {n: (proj(*a[0]), a[1]) for n, a in afluentes.items()}
+    C_afl = {n: (a[2] if len(a) > 2 else 0.0) for n, a in afluentes.items()}
+    barr_xy = proj(*cfg.get('barragem', BARRAGEM_LONLAT))
     fonte_xy = proj(*cfg['fonte_lonlat'])
-    pontos_xy = {n: proj(*ll) for n, ll in PONTOS.items()}
+    pontos = cfg.get('pontos') or PONTOS
+    pontos_xy = {n: proj(*ll) for n, ll in pontos.items()}
 
     # máscaras das faces (grade C): face aberta só se as 2 células são água
     mu = np.zeros((ny, nx + 1), bool); mu[:, 1:-1] = wet[:, :-1] & wet[:, 1:]
@@ -261,8 +273,14 @@ def simular(cfg=CFG):
 
     # fontes/sumidouros de volume (m³/s por célula)
     Qsrc = np.zeros((ny, nx))
+    QCsrc = np.zeros((ny, nx))                # carga dos afluentes (g/s)
     for nome, (xy, Q) in afl_xy.items():
         Qsrc[indice_celula(xy, X, Y, wet)] += Q
+        QCsrc[indice_celula(xy, X, Y, wet)] += Q * C_afl[nome]
+    rampa_Q = cfg.get('rampa_vazao', 0.0)     # vazões crescem de 0 ao nominal (1 - cos)
+    fator_Q = lambda t: 0.5 * (1 - np.cos(np.pi * min(t / rampa_Q, 1.0))) if rampa_Q > 0 else 1.0
+    dias_mapas = sorted(cfg.get('instantes_dias', ()))
+    mapas = {}
     jf, if_ = indice_celula(fonte_xy, X, Y, wet)
     jb, ib = indice_celula(barr_xy, X, Y, wet)
     Q_ete = cfg['Q_fonte'] if cfg['modo'] == 'continuo' else 0.0
@@ -277,7 +295,9 @@ def simular(cfg=CFG):
     print(f"dt = {dt:.2f} s, {nsteps} passos")
 
     pontos_idx = {n: indice_celula(xy, X, Y, wet) for n, xy in pontos_xy.items()}
-    serie_t, serie_C = [], {n: [] for n in PONTOS}
+    serie_cada = max(20, nsteps // 10000)     # ~10⁴ pontos nas séries, qualquer duração
+    serie_t, serie_C = [], {n: [] for n in pontos}
+    serie_massa, serie_saiu, serie_entrou = [], [], []
     quadros = []            # (t, C, u_c, v_c)
     massa_lancada = cfg['massa_derrame'] if cfg['modo'] == 'derrame' else 0.0
     massa_saiu = 0.0
@@ -292,10 +312,15 @@ def simular(cfg=CFG):
             uc = 0.5 * (u[:, 1:] + u[:, :-1]); vc = 0.5 * (v[1:, :] + v[:-1, :])
             quadros.append((t, C.copy(), uc, vc))
             prox_saida += cfg['saida_cada']
-        if n % 20 == 0:
+        if n % serie_cada == 0:
             serie_t.append(t)
             for nome, (j, i) in pontos_idx.items():
                 serie_C[nome].append(C[j, i])
+            serie_massa.append((C * np.where(wet, h + eta, 0) * area).sum())
+            serie_saiu.append(massa_saiu); serie_entrou.append(massa_lancada)
+        for d in dias_mapas:
+            if d not in mapas and t >= d * 86400.0 - 1e-6:
+                mapas[d] = C.copy()
         if n == nsteps:
             break
 
@@ -308,10 +333,11 @@ def simular(cfg=CFG):
         Fy = Hv * v * mv
         fonte_ativa = (cfg['modo'] == 'continuo' and
                        (cfg['duracao_fonte'] is None or t < cfg['duracao_fonte']))
-        S = Qsrc.copy()
+        rQ = fator_Q(t)
+        S = rQ * Qsrc
         if fonte_ativa:
             S[jf, if_] += Q_ete
-        Q_saida = Qsrc.sum() + (Q_ete if fonte_ativa else 0.0)   # nível médio constante
+        Q_saida = rQ * Qsrc.sum() + (Q_ete if fonte_ativa else 0.0)   # nível médio constante
         S[jb, ib] -= Q_saida
         V_old = H * area
         eta = eta - dt * ((Fx[:, 1:] - Fx[:, :-1]) / dx + (Fy[1:, :] - Fy[:-1, :]) / dx) \
@@ -330,6 +356,8 @@ def simular(cfg=CFG):
         if fonte_ativa:
             dm = cfg['C_fonte'] * Q_ete * dt
             M[jf, if_] += dm; massa_lancada += dm
+        if rQ > 0 and QCsrc.any():
+            M += rQ * QCsrc * dt; massa_lancada += rQ * QCsrc.sum() * dt
         saida = min(Q_saida * C[jb, ib] * dt, M[jb, ib])
         M[jb, ib] -= saida; massa_saiu += saida
         perda = M * (1 - np.exp(-k_dec * dt)); M -= perda; massa_decaiu += perda.sum()
@@ -375,6 +403,22 @@ def simular(cfg=CFG):
     print(f"\nMassa lançada: {massa_lancada/1e6:.3f} t | no lago: {massa_lago/1e6:.3f} t | "
           f"saiu pela barragem: {massa_saiu/1e6:.3f} t | decaiu: {massa_decaiu/1e6:.3f} t")
     print(f"Erro de conservação: {erro/max(massa_lancada,1e-12)*100:.2e} %")
+    t_parede = time.time() - t0
+    print(f"Tempo de parede: {t_parede:.1f} s, {nsteps} passos, {t_parede / max(nsteps, 1) * 1e3:.3f} ms/passo")
+    uc = 0.5 * (u[:, 1:] + u[:, :-1]); vc = 0.5 * (v[1:, :] + v[:-1, :])
+    origem = np.zeros(2)
+    if cfg.get('contorno_utm'):           # coordenadas da grade -> UTM
+        with open(cfg['contorno_utm']) as fh:
+            origem = np.array(json.load(fh)['contorno'], float).min(0) - 2 * dx
+    np.savez(os.path.join(cfg['pasta_saida'], 'resultados.npz'),
+             x=X[0] + origem[0], y=Y[:, 0] + origem[1], wet=wet, C=C, u=uc, v=vc, eta=eta,
+             dt=dt, nsteps=nsteps, t_parede=t_parede, t_final=t,
+             massa_lancada=massa_lancada, massa_lago=massa_lago, massa_saiu=massa_saiu,
+             massa_decaiu=massa_decaiu, serie_t=np.array(serie_t),
+             serie_massa=np.array(serie_massa), serie_saiu=np.array(serie_saiu),
+             serie_entrou=np.array(serie_entrou), nomes_sondas=list(serie_C),
+             sondas=np.array([serie_C[k] for k in serie_C]).T,
+             dias_mapas=np.array(sorted(mapas)), **{f'C_{d}d': c for d, c in mapas.items()})
 
     return dict(X=X, Y=Y, wet=wet, h=h, aneis=aneis, quadros=quadros,
                 serie_t=np.array(serie_t),
@@ -400,6 +444,11 @@ def _rodape(ax):
             fontsize=6, color='0.3')
 
 
+def _tempo(t):
+    """Rótulo de tempo em horas (até 2 dias) ou em dias."""
+    return f't = {t / 3600:.0f} h' if t <= 2 * 86400 else f't = {t / 86400:.0f} dias'
+
+
 def plotar(res):
     X, Y, wet = res['X'] / 1e3, res['Y'] / 1e3, res['wet']
     cfg = res['cfg']; out = cfg['pasta_saida']
@@ -417,13 +466,16 @@ def plotar(res):
         ax.annotate(f'{nome}\n({Q} m³/s)', km(xy), fontsize=7, xytext=(5, 3), textcoords='offset points')
     ax.plot(*km(res['barr_xy']), 'ks', ms=9)
     ax.annotate('Barragem', km(res['barr_xy']), fontsize=8, xytext=(-20, 10), textcoords='offset points')
-    ax.plot(*km(res['fonte_xy']), 'r*', ms=15, label='Lançamento')
+    if cfg['modo'] != 'continuo' or cfg['Q_fonte'] > 0:
+        ax.plot(*km(res['fonte_xy']), 'r*', ms=15, label='Lançamento')
     for nome, xy in res['pontos_xy'].items():
         ax.plot(*km(xy), 'o', mfc='none', mec='k')
         ax.annotate(nome.split()[0], km(xy), fontsize=8, xytext=(4, -10), textcoords='offset points')
     ax.set(title=f"Lago Paranoá — contorno OSM, profundidade constante {cfg['prof']:.0f} m",
            xlabel='x (km)', ylabel='y (km)', aspect='equal')
-    ax.legend(loc='upper right'); _rodape(ax); fig.tight_layout()
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(loc='upper right')
+    _rodape(ax); fig.tight_layout()
     fig.savefig(f'{out}/01_mapa.png', dpi=150); plt.close(fig)
 
     # --- mapas de concentração ---
@@ -447,18 +499,20 @@ def plotar(res):
         q = ax.quiver(X[::s, ::s][m], Y[::s, ::s][m], us * fat, vs * fat, color='0.25',
                       angles='xy', scale_units='xy', scale=0.002, width=0.0025)
         ax.quiverkey(q, 0.78, 0.95, 0.002, '2 mm/s', coordinates='axes')
-        ax.set(title=f't = {t/3600:.0f} h', xlabel='x (km)', ylabel='y (km)', aspect='equal')
+        ax.set(title=_tempo(t), xlabel='x (km)', ylabel='y (km)', aspect='equal')
         plt.colorbar(im, ax=ax, label='C (mg/L)', shrink=0.75)
         _rodape(ax)
     fig.suptitle(f"Dispersão do poluente — vento {cfg['vento_vel']} m/s de {cfg['vento_dir']:.0f}°, "
-                 f"Kh = {cfg['Kh']} m²/s", fontsize=14)
+                 f"Kh = {cfg['Kh']} m²/s" + (f" ({cfg['titulo']})" if cfg.get('titulo') else ""),
+                 fontsize=14)
     fig.tight_layout(); fig.savefig(f'{out}/02_concentracao.png', dpi=150); plt.close(fig)
 
     # --- séries temporais ---
     fig, ax = plt.subplots(figsize=(9, 4.5))
+    esc, unid = (3600, 'h') if res['serie_t'][-1] <= 2 * 86400 * 7 else (86400, 'dias')
     for nome, c in res['serie_C'].items():
-        ax.plot(res['serie_t'] / 3600, c, label=nome)
-    ax.set(xlabel='Tempo (h)', ylabel='C (mg/L)', title='Concentração nos pontos de monitoramento')
+        ax.plot(res['serie_t'] / esc, c, label=nome)
+    ax.set(xlabel=f'Tempo ({unid})', ylabel='C (mg/L)', title='Concentração nos pontos de monitoramento')
     ax.grid(alpha=0.3); ax.legend(); fig.tight_layout()
     fig.savefig(f'{out}/03_series.png', dpi=150); plt.close(fig)
 
@@ -471,7 +525,7 @@ def plotar(res):
         plt.colorbar(im, ax=ax, label='C (mg/L)', shrink=0.75)
         tit = ax.set_title('')
         def upd(k):
-            im.set_data(mascara(quadros[k][1])); tit.set_text(f't = {quadros[k][0]/3600:.0f} h')
+            im.set_data(mascara(quadros[k][1])); tit.set_text(_tempo(quadros[k][0]))
             return im, tit
         try:
             anim = animation.FuncAnimation(fig, upd, frames=len(quadros), interval=300)
@@ -482,6 +536,52 @@ def plotar(res):
     print(f"Figuras salvas em ./{out}/")
 
 
+# =============================================================================
+# 5. CASO DO CORDEL (mesma física do caso 'paranoa' do repositório cordel)
+# =============================================================================
+def cfg_cordel(dias=7.0, dx=80.0, pasta='resultados/caso_cordel_7d', mapas=None,
+               contorno='paranoa_contorno_cordel.json'):
+    """Parâmetros do caso casos/paranoa.py do Cordel: contorno do Cordel (UTM 23S,
+    sem ilhas), 5 afluentes com as vazões e posições de lá, C/C0 = 1 na água do
+    Riacho Fundo, saída na barragem, nu = Kh = 0,1 m²/s, rampa de 1 dia nas
+    vazões; sem vento, Coriolis, atrito de fundo nem decaimento."""
+    with open(contorno) as fh:
+        D = json.load(fh)
+    E = D['entradas']
+    vazoes = dict(bananal=1.5, torto=2.0, riacho_fundo=2.5, gama=2.0, cabeca_de_veado=0.5)
+    c = dict(CFG)
+    c.update(dx=dx, t_final=dias * 86400.0, saida_cada=dias * 86400.0 / 28,
+             latitude=0.0, cd_fundo=0.0, nu=0.1, Kh=0.1, decaimento=0.0,
+             vento_vel=0.0, rampa_vento=0.0, modo='continuo', Q_fonte=0.0,
+             contorno_utm=contorno, pasta_saida=pasta, rampa_vazao=86400.0,
+             afluentes={k: (E[k], Q, 1.0 if k == 'riacho_fundo' else 0.0) for k, Q in vazoes.items()},
+             barragem=tuple(D['saida']), fonte_lonlat=tuple(E['riacho_fundo']),
+             # nós das sondas do Cordel (no_central de casos/paranoa.py, malha h = 80 m)
+             pontos={"Braço do Riacho Fundo": (190037.6, 8246848.2), "Braço Sul": (194857.4, 8247468.7),
+                     "Corpo central": (197561.2, 8250827.5), "Braço Norte": (195427.9, 8255268.4),
+                     "Barragem": (200550.9, 8251932.0)},
+             instantes_dias=tuple(d for d in (mapas or ((1, 2, 4, 7) if dias <= 7 else (30, 90, 180, 365)))
+                                  if d <= dias + 1e-9),
+             titulo='caso do Cordel, C em C/C0')
+    return c
+
+
 if __name__ == '__main__':
-    resultado = simular(CFG)
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[1])
+    ap.add_argument('--caso', choices=['padrao', 'cordel'], default='padrao',
+                    help="'cordel': parâmetros do caso paranoa do repositório cordel")
+    ap.add_argument('--dias', type=float, default=7.0, help='duração (caso cordel)')
+    ap.add_argument('--dx', type=float, default=80.0, help='resolução em m (caso cordel)')
+    ap.add_argument('--pasta', default=None, help='pasta de saída (caso cordel)')
+    ap.add_argument('--mapas', default=None,
+                    help='dias dos mapas gravados, ex. 30,90,180,365 (caso cordel; padrão: '
+                         '1,2,4,7 até 7 dias e 30,90,180,365 acima)')
+    a = ap.parse_args()
+    if a.caso == 'cordel':
+        mapas = tuple(float(d) if '.' in d else int(d) for d in a.mapas.split(',')) if a.mapas else None
+        cfg = cfg_cordel(a.dias, a.dx, a.pasta or f'resultados/caso_cordel_{a.dias:g}d', mapas)
+    else:
+        cfg = CFG
+    resultado = simular(cfg)
     plotar(resultado)
