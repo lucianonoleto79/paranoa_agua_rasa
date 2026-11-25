@@ -128,6 +128,52 @@ python3 simulacao_paranoa.py --caso cordel --dias 7 --dx 80
 python post/comparar_paranoa.py --fvm ../fvm-cfd --ar ../paranoa_agua_rasa
 ```
 
+## Rodar 365 dias em outro computador
+
+Estimativas a partir das rodadas de 7 dias, com a mesma malha de 80 m (o tempo cresce
+na proporção do número de passos): Cordel ~22 min (a rodada de 365 dias de
+[`resultados/paranoa/`](https://github.com/lucianonoleto79/cordel/tree/main/resultados/paranoa) do Cordel levou 22 min), fvm-cfd ~3 min e água rasa **~15 h**
+(12,1 milhões de passos de 2,6 s, a ~4,4 ms por passo). A água rasa não grava
+checkpoint: rode-a num computador que fique ligado o tempo todo. Com `--dx 160` ela
+leva ~2 h, mas fica numa malha diferente das outras duas.
+
+Os três repositórios lado a lado (troque a branch por `main` depois que as PRs forem
+mescladas):
+
+```bash
+for r in cordel fvm-cfd paranoa_agua_rasa; do
+  git clone -b claude/happy-johnson-s0d2ht https://github.com/lucianonoleto79/$r.git
+done
+pip install -r cordel/requirements.txt -r fvm-cfd/requirements.txt -r paranoa_agua_rasa/requirements.txt triangle
+```
+
+```bash
+# Cordel (~22 min); em outra aba: python post/contador.py --watch 15
+cd cordel
+python cordel2008v4.py paranoa --tmax 31536000 --saida paranoa_365d --op dias=30,90,180,365 2>&1 | tee paranoa_365d.log
+# se for interrompido: repita o comando com --continuar
+cd ..
+```
+
+```bash
+# fvm-cfd (~3 min; grava em results/paranoa_365d_h80/)
+cd fvm-cfd && python python/paranoa.py --dias 365 && cd ..
+```
+
+```bash
+# água rasa (~15 h; grava em resultados/caso_cordel_365d/, mapas em 30, 90, 180 e 365 dias)
+cd paranoa_agua_rasa && python3 simulacao_paranoa.py --caso cordel --dias 365 --dx 80 && cd ..
+```
+
+```bash
+# comparação (grava em cordel/resultados/comparacao_paranoa_365d/)
+cd cordel
+python post/comparar_paranoa.py --dias 365 --mapas 30,90,180,365 --log-cordel paranoa_365d.log
+```
+
+Com mais de 30 dias, a comparação mostra os mapas do lago inteiro e o perfil vai da foz
+até a barragem.
+
 ## Sugestões de tópicos para o trabalho
 
 1. **Formulações.** Escreva as equações resolvidas por cada código e as hipóteses

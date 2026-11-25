@@ -295,6 +295,7 @@ def simular(cfg=CFG):
     print(f"dt = {dt:.2f} s, {nsteps} passos")
 
     pontos_idx = {n: indice_celula(xy, X, Y, wet) for n, xy in pontos_xy.items()}
+    serie_cada = max(20, nsteps // 10000)     # ~10⁴ pontos nas séries, qualquer duração
     serie_t, serie_C = [], {n: [] for n in pontos}
     serie_massa, serie_saiu, serie_entrou = [], [], []
     quadros = []            # (t, C, u_c, v_c)
@@ -311,7 +312,7 @@ def simular(cfg=CFG):
             uc = 0.5 * (u[:, 1:] + u[:, :-1]); vc = 0.5 * (v[1:, :] + v[:-1, :])
             quadros.append((t, C.copy(), uc, vc))
             prox_saida += cfg['saida_cada']
-        if n % 20 == 0:
+        if n % serie_cada == 0:
             serie_t.append(t)
             for nome, (j, i) in pontos_idx.items():
                 serie_C[nome].append(C[j, i])
@@ -443,6 +444,11 @@ def _rodape(ax):
             fontsize=6, color='0.3')
 
 
+def _tempo(t):
+    """Rótulo de tempo em horas (até 2 dias) ou em dias."""
+    return f't = {t / 3600:.0f} h' if t <= 2 * 86400 else f't = {t / 86400:.0f} dias'
+
+
 def plotar(res):
     X, Y, wet = res['X'] / 1e3, res['Y'] / 1e3, res['wet']
     cfg = res['cfg']; out = cfg['pasta_saida']
@@ -493,7 +499,7 @@ def plotar(res):
         q = ax.quiver(X[::s, ::s][m], Y[::s, ::s][m], us * fat, vs * fat, color='0.25',
                       angles='xy', scale_units='xy', scale=0.002, width=0.0025)
         ax.quiverkey(q, 0.78, 0.95, 0.002, '2 mm/s', coordinates='axes')
-        ax.set(title=f't = {t/3600:.0f} h', xlabel='x (km)', ylabel='y (km)', aspect='equal')
+        ax.set(title=_tempo(t), xlabel='x (km)', ylabel='y (km)', aspect='equal')
         plt.colorbar(im, ax=ax, label='C (mg/L)', shrink=0.75)
         _rodape(ax)
     fig.suptitle(f"Dispersão do poluente — vento {cfg['vento_vel']} m/s de {cfg['vento_dir']:.0f}°, "
@@ -503,9 +509,10 @@ def plotar(res):
 
     # --- séries temporais ---
     fig, ax = plt.subplots(figsize=(9, 4.5))
+    esc, unid = (3600, 'h') if res['serie_t'][-1] <= 2 * 86400 * 7 else (86400, 'dias')
     for nome, c in res['serie_C'].items():
-        ax.plot(res['serie_t'] / 3600, c, label=nome)
-    ax.set(xlabel='Tempo (h)', ylabel='C (mg/L)', title='Concentração nos pontos de monitoramento')
+        ax.plot(res['serie_t'] / esc, c, label=nome)
+    ax.set(xlabel=f'Tempo ({unid})', ylabel='C (mg/L)', title='Concentração nos pontos de monitoramento')
     ax.grid(alpha=0.3); ax.legend(); fig.tight_layout()
     fig.savefig(f'{out}/03_series.png', dpi=150); plt.close(fig)
 
@@ -518,7 +525,7 @@ def plotar(res):
         plt.colorbar(im, ax=ax, label='C (mg/L)', shrink=0.75)
         tit = ax.set_title('')
         def upd(k):
-            im.set_data(mascara(quadros[k][1])); tit.set_text(f't = {quadros[k][0]/3600:.0f} h')
+            im.set_data(mascara(quadros[k][1])); tit.set_text(_tempo(quadros[k][0]))
             return im, tit
         try:
             anim = animation.FuncAnimation(fig, upd, frames=len(quadros), interval=300)
@@ -532,7 +539,7 @@ def plotar(res):
 # =============================================================================
 # 5. CASO DO CORDEL (mesma física do caso 'paranoa' do repositório cordel)
 # =============================================================================
-def cfg_cordel(dias=7.0, dx=80.0, pasta='resultados/caso_cordel_7d',
+def cfg_cordel(dias=7.0, dx=80.0, pasta='resultados/caso_cordel_7d', mapas=None,
                contorno='paranoa_contorno_cordel.json'):
     """Parâmetros do caso casos/paranoa.py do Cordel: contorno do Cordel (UTM 23S,
     sem ilhas), 5 afluentes com as vazões e posições de lá, C/C0 = 1 na água do
@@ -553,7 +560,9 @@ def cfg_cordel(dias=7.0, dx=80.0, pasta='resultados/caso_cordel_7d',
              pontos={"Braço do Riacho Fundo": (190037.6, 8246848.2), "Braço Sul": (194857.4, 8247468.7),
                      "Corpo central": (197561.2, 8250827.5), "Braço Norte": (195427.9, 8255268.4),
                      "Barragem": (200550.9, 8251932.0)},
-             instantes_dias=(1, 2, 4, 7), titulo='caso do Cordel, C em C/C0')
+             instantes_dias=tuple(d for d in (mapas or ((1, 2, 4, 7) if dias <= 7 else (30, 90, 180, 365)))
+                                  if d <= dias + 1e-9),
+             titulo='caso do Cordel, C em C/C0')
     return c
 
 
@@ -565,9 +574,13 @@ if __name__ == '__main__':
     ap.add_argument('--dias', type=float, default=7.0, help='duração (caso cordel)')
     ap.add_argument('--dx', type=float, default=80.0, help='resolução em m (caso cordel)')
     ap.add_argument('--pasta', default=None, help='pasta de saída (caso cordel)')
+    ap.add_argument('--mapas', default=None,
+                    help='dias dos mapas gravados, ex. 30,90,180,365 (caso cordel; padrão: '
+                         '1,2,4,7 até 7 dias e 30,90,180,365 acima)')
     a = ap.parse_args()
     if a.caso == 'cordel':
-        cfg = cfg_cordel(a.dias, a.dx, a.pasta or f'resultados/caso_cordel_{a.dias:g}d')
+        mapas = tuple(float(d) if '.' in d else int(d) for d in a.mapas.split(',')) if a.mapas else None
+        cfg = cfg_cordel(a.dias, a.dx, a.pasta or f'resultados/caso_cordel_{a.dias:g}d', mapas)
     else:
         cfg = CFG
     resultado = simular(cfg)

@@ -48,6 +48,11 @@ entrada difusiva que a condição C = 1 imposta na foz produz no Cordel).
 python3 simulacao_paranoa.py --caso cordel --dias 7 --dx 80
 ```
 
+Com `--dias` acima de 7 os mapas são gravados em 30, 90, 180 e 365 dias (escolha outros com
+`--mapas`). 365 dias com `--dx 80` levam ~15 h (12 milhões de passos de 2,6 s) e não há
+checkpoint: rode num computador que fique ligado. Os comandos para rodar os três códigos por
+365 dias estão no relatório de comparação.
+
 Em 7 dias (grade 170 × 191 de 80 m, 5 947 células molhadas): Δt = 2,6 s pelo CFL das
 ondas de gravidade, 232 003 passos, 17 min (4,4 ms por passo). A isolinha de C/C0 = 1% chega
 a 1,07 km da foz do Riacho Fundo (Cordel e fvm-cfd: 1,11 km); C/C0 = 0,0016 na sonda do
