@@ -49,8 +49,15 @@ python3 simulacao_paranoa.py --caso cordel --dias 7 --dx 80
 ```
 
 Com `--dias` acima de 7 os mapas são gravados em 30, 90, 180 e 365 dias (escolha outros com
-`--mapas`). 365 dias com `--dx 80` levam ~15 h (12 milhões de passos de 2,6 s) e não há
-checkpoint: rode num computador que fique ligado. Os comandos para rodar os três códigos por
+`--mapas`). 365 dias com `--dx 80` levam ~15 h (12 milhões de passos de 2,6 s). O estado é gravado em
+`<pasta>/checkpoint.npz` a cada 30 min de tempo de parede; `--parar-apos HORAS` grava e para
+(código 3) depois de HORAS, e `--continuar` retoma do checkpoint com resultado idêntico ao de uma
+rodada direta:
+
+```bash
+python3 simulacao_paranoa.py --caso cordel --dias 365 --dx 80 --parar-apos 1.75
+python3 simulacao_paranoa.py --caso cordel --dias 365 --dx 80 --parar-apos 1.75 --continuar   # repetir até terminar
+``` Os comandos para rodar os três códigos por
 365 dias estão no relatório de comparação.
 
 Em 7 dias (grade 170 × 191 de 80 m, 5 947 células molhadas): Δt = 2,6 s pelo CFL das

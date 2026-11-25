@@ -305,8 +305,44 @@ def simular(cfg=CFG):
     prox_saida = 0.0
     t = 0.0
     t0 = time.time()
+    n0, t_parede_antes = 0, 0.0
+    ck = cfg.get('checkpoint')
+    if ck and cfg.get('continuar'):
+        if not os.path.exists(ck):
+            raise SystemExit(f'--continuar: checkpoint {ck} não encontrado')
+        E = np.load(ck, allow_pickle=False)
+        n0, t, prox_saida = int(E['n']) + 1, float(E['t']), float(E['prox_saida'])
+        eta, u, v, C = E['eta'].copy(), E['u'].copy(), E['v'].copy(), E['C'].copy()
+        massa_lancada, massa_saiu, massa_decaiu = (float(E[k]) for k in ('massa_lancada', 'massa_saiu', 'massa_decaiu'))
+        t_parede_antes = float(E['t_parede'])
+        serie_t = list(E['serie_t']); serie_massa = list(E['serie_massa'])
+        serie_saiu = list(E['serie_saiu']); serie_entrou = list(E['serie_entrou'])
+        for k, nome in enumerate(serie_C):
+            serie_C[nome] = list(E['sondas'][:, k])
+        mapas = {d: E[f'mapa_{d}'] for d in dias_mapas if f'mapa_{d}' in E.files}
+        quadros = [(float(tq), Cq, uq, vq) for tq, Cq, uq, vq in
+                   zip(E['quadros_t'], E['quadros_C'], E['quadros_u'], E['quadros_v'])]
+        print(f"Retomando do checkpoint: passo {n0} de {nsteps}, t = {t / 86400:.2f} dias "
+              f"({t_parede_antes:.0f} s de parede antes)")
 
-    for n in range(nsteps + 1):
+    def gravar_checkpoint(n):
+        """Estado depois do passo n (a retomada segue do passo n + 1), gravado de forma atômica."""
+        tmp = ck + '.tmp.npz'
+        np.savez_compressed(
+            tmp, n=n, t=t, prox_saida=prox_saida, eta=eta, u=u, v=v, C=C,
+            massa_lancada=massa_lancada, massa_saiu=massa_saiu, massa_decaiu=massa_decaiu,
+            t_parede=t_parede_antes + time.time() - t0, serie_t=np.array(serie_t),
+            serie_massa=np.array(serie_massa), serie_saiu=np.array(serie_saiu),
+            serie_entrou=np.array(serie_entrou), sondas=np.array([serie_C[k] for k in serie_C]).T,
+            quadros_t=np.array([q[0] for q in quadros]), quadros_C=np.array([q[1] for q in quadros]),
+            quadros_u=np.array([q[2] for q in quadros]), quadros_v=np.array([q[3] for q in quadros]),
+            **{f'mapa_{d}': c for d, c in mapas.items()})
+        os.replace(tmp, ck)
+
+    parar_s = cfg.get('parar_apos_h', 0) * 3600.0
+    prox_ck = time.time() + 1800.0
+
+    for n in range(n0, nsteps + 1):
         # ---------------- saídas ----------------
         if t >= prox_saida - 1e-9:
             uc = 0.5 * (u[:, 1:] + u[:, :-1]); vc = 0.5 * (v[1:, :] + v[:-1, :])
@@ -392,6 +428,14 @@ def simular(cfg=CFG):
         v = np.where(mv, (v + dt * rhs) / (1 + dt * atr), 0.0)
 
         t += dt
+        if ck and (time.time() >= prox_ck or (parar_s and time.time() - t0 >= parar_s)):
+            gravar_checkpoint(n)
+            prox_ck = time.time() + 1800.0
+            if parar_s and time.time() - t0 >= parar_s:
+                print(f"Parado após {parar_s / 3600:g} h de parede no passo {n + 1} de {nsteps} "
+                      f"(t = {t / 86400:.2f} dias); checkpoint em {ck}. Retome com --continuar.",
+                      flush=True)
+                raise SystemExit(3)
         if n % 10000 == 0 and n > 0:
             vel = np.hypot(0.5 * (u[:, 1:] + u[:, :-1]), 0.5 * (v[1:, :] + v[:-1, :]))
             print(f"  t = {t/3600:6.1f} h | |U|max = {vel.max():.4f} m/s | "
@@ -403,7 +447,7 @@ def simular(cfg=CFG):
     print(f"\nMassa lançada: {massa_lancada/1e6:.3f} t | no lago: {massa_lago/1e6:.3f} t | "
           f"saiu pela barragem: {massa_saiu/1e6:.3f} t | decaiu: {massa_decaiu/1e6:.3f} t")
     print(f"Erro de conservação: {erro/max(massa_lancada,1e-12)*100:.2e} %")
-    t_parede = time.time() - t0
+    t_parede = t_parede_antes + time.time() - t0
     print(f"Tempo de parede: {t_parede:.1f} s, {nsteps} passos, {t_parede / max(nsteps, 1) * 1e3:.3f} ms/passo")
     uc = 0.5 * (u[:, 1:] + u[:, :-1]); vc = 0.5 * (v[1:, :] + v[:-1, :])
     origem = np.zeros(2)
@@ -577,11 +621,18 @@ if __name__ == '__main__':
     ap.add_argument('--mapas', default=None,
                     help='dias dos mapas gravados, ex. 30,90,180,365 (caso cordel; padrão: '
                          '1,2,4,7 até 7 dias e 30,90,180,365 acima)')
+    ap.add_argument('--continuar', action='store_true',
+                    help='retoma do checkpoint (<pasta>/checkpoint.npz) gravado por uma rodada anterior')
+    ap.add_argument('--parar-apos', type=float, default=0.0, metavar='HORAS',
+                    help='grava o checkpoint e para (código 3) após HORAS de tempo de parede')
     a = ap.parse_args()
     if a.caso == 'cordel':
         mapas = tuple(float(d) if '.' in d else int(d) for d in a.mapas.split(',')) if a.mapas else None
         cfg = cfg_cordel(a.dias, a.dx, a.pasta or f'resultados/caso_cordel_{a.dias:g}d', mapas)
     else:
-        cfg = CFG
+        cfg = dict(CFG)
+    # checkpoint: gravado a cada 30 min de parede e ao parar por --parar-apos
+    cfg.update(checkpoint=os.path.join(cfg['pasta_saida'], 'checkpoint.npz'),
+               continuar=a.continuar, parar_apos_h=a.parar_apos)
     resultado = simular(cfg)
     plotar(resultado)
