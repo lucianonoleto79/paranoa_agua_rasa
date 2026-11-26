@@ -49,9 +49,26 @@ python3 simulacao_paranoa.py --caso cordel --dias 7 --dx 80
 ```
 
 Com `--dias` acima de 7 os mapas são gravados em 30, 90, 180 e 365 dias (escolha outros com
-`--mapas`). 365 dias com `--dx 80` levam ~15 h (12 milhões de passos de 2,6 s) e não há
-checkpoint: rode num computador que fique ligado. Os comandos para rodar os três códigos por
+`--mapas`). 365 dias com `--dx 80` levam ~15 h (12 milhões de passos de 2,6 s). O estado é gravado em
+`<pasta>/checkpoint.npz` a cada 30 min de tempo de parede; `--parar-apos HORAS` grava e para
+(código 3) depois de HORAS, e `--continuar` retoma do checkpoint com resultado idêntico ao de uma
+rodada direta:
+
+```bash
+python3 simulacao_paranoa.py --caso cordel --dias 365 --dx 80 --parar-apos 1.75
+python3 simulacao_paranoa.py --caso cordel --dias 365 --dx 80 --parar-apos 1.75 --continuar   # repetir até terminar
+``` Os comandos para rodar os três códigos por
 365 dias estão no relatório de comparação.
+
+**Rodada de 365 dias** ([`resultados/caso_cordel_365d/`](resultados/caso_cordel_365d/)): 12 097 253 passos
+em 13,4 h, em 8 trechos de 1h45 (`trecho_01.log` … `trecho_08.log`). C/C0 média de 0,172 no lago,
+0,118 no corpo central, 0,022 na barragem e 0 no Braço Norte; 0,46% do poluente saiu pela barragem;
+massa conservada a 3×10⁻¹⁰. A comparação com o Cordel e o fvm-cfd está em
+[`resultados/comparacao_codigos_365d/`](resultados/comparacao_codigos_365d/) (cópia do relatório do
+Cordel), e o enunciado do trabalho de disciplina, em `trabalho/enunciado.pdf` do
+[Cordel](https://github.com/lucianonoleto79/cordel/blob/main/trabalho/enunciado.pdf).
+
+![Caso do Cordel, 365 dias](resultados/caso_cordel_365d/02_concentracao.png)
 
 Em 7 dias (grade 170 × 191 de 80 m, 5 947 células molhadas): Δt = 2,6 s pelo CFL das
 ondas de gravidade, 232 003 passos, 17 min (4,4 ms por passo). A isolinha de C/C0 = 1% chega

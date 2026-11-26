@@ -130,12 +130,12 @@ python post/comparar_paranoa.py --fvm ../fvm-cfd --ar ../paranoa_agua_rasa
 
 ## Rodar 365 dias em outro computador
 
-Estimativas a partir das rodadas de 7 dias, com a mesma malha de 80 m (o tempo cresce
-na proporção do número de passos): Cordel ~22 min (a rodada de 365 dias de
-[`resultados/paranoa/`](https://github.com/lucianonoleto79/cordel/tree/main/resultados/paranoa) do Cordel levou 22 min), fvm-cfd ~3 min e água rasa **~15 h**
-(12,1 milhões de passos de 2,6 s, a ~4,4 ms por passo). A água rasa não grava
-checkpoint: rode-a num computador que fique ligado o tempo todo. Com `--dx 160` ela
-leva ~2 h, mas fica numa malha diferente das outras duas.
+A rodada de 365 dias já foi feita e está comparada em
+[`resultados/comparacao_paranoa_365d/`](https://github.com/lucianonoleto79/cordel/tree/main/resultados/comparacao_paranoa_365d) do Cordel. Tempos medidos: Cordel 16 min,
+fvm-cfd 3 min e água rasa **13,4 h** (12,1 milhões de passos de 2,6 s, a ~4 ms por passo).
+A água rasa grava checkpoint a cada 30 min e pode ser rodada em trechos com
+`--parar-apos HORAS` e `--continuar`. Com `--dx 160` ela leva ~2 h, mas fica numa malha
+diferente das outras duas.
 
 Os três repositórios lado a lado (troque a branch por `main` depois que as PRs forem
 mescladas):
@@ -161,8 +161,9 @@ cd fvm-cfd && python python/paranoa.py --dias 365 && cd ..
 ```
 
 ```bash
-# água rasa (~15 h; grava em resultados/caso_cordel_365d/, mapas em 30, 90, 180 e 365 dias)
+# água rasa (~13 h; grava em resultados/caso_cordel_365d/, mapas em 30, 90, 180 e 365 dias)
 cd paranoa_agua_rasa && python3 simulacao_paranoa.py --caso cordel --dias 365 --dx 80 && cd ..
+# ou em trechos: acrescente --parar-apos 1.75 e repita com --continuar até terminar
 ```
 
 ```bash
