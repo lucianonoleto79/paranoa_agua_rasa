@@ -60,6 +60,16 @@ python3 simulacao_paranoa.py --caso cordel --dias 365 --dx 80 --parar-apos 1.75 
 ``` Os comandos para rodar os três códigos por
 365 dias estão no relatório de comparação.
 
+**Rodada de 365 dias** ([`resultados/caso_cordel_365d/`](resultados/caso_cordel_365d/)): 12 097 253 passos
+em 13,4 h, em 8 trechos de 1h45 (`trecho_01.log` … `trecho_08.log`). C/C0 média de 0,172 no lago,
+0,118 no corpo central, 0,022 na barragem e 0 no Braço Norte; 0,46% do poluente saiu pela barragem;
+massa conservada a 3×10⁻¹⁰. A comparação com o Cordel e o fvm-cfd está em
+[`resultados/comparacao_codigos_365d/`](resultados/comparacao_codigos_365d/) (cópia do relatório do
+Cordel), e o enunciado do trabalho de disciplina, em `trabalho/enunciado.pdf` do
+[Cordel](https://github.com/lucianonoleto79/cordel/blob/main/trabalho/enunciado.pdf).
+
+![Caso do Cordel, 365 dias](resultados/caso_cordel_365d/02_concentracao.png)
+
 Em 7 dias (grade 170 × 191 de 80 m, 5 947 células molhadas): Δt = 2,6 s pelo CFL das
 ondas de gravidade, 232 003 passos, 17 min (4,4 ms por passo). A isolinha de C/C0 = 1% chega
 a 1,07 km da foz do Riacho Fundo (Cordel e fvm-cfd: 1,11 km); C/C0 = 0,0016 na sonda do
